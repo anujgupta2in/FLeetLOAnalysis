@@ -176,7 +176,6 @@ total      = len(df)
 n_uptodate = (df["Status"] == "Up-to-date").sum()
 n_overdue  = (df["Status"] == "Overdue").sum()
 n_nodate   = (df["Status"] == "No Date").sum()
-health_pct = round(n_uptodate / total * 100, 1) if total else 0
 
 n_31_60 = (df["Overdue Bucket"] == "90–180 days").sum()
 n_61_90 = (df["Overdue Bucket"] == "181–210 days").sum()
@@ -185,17 +184,96 @@ n_90p   = (df["Overdue Bucket"] == "210+ days").sum()
 vc_has_date  = (df["VesselCheck"].str.match(r"\d{4}-\d{2}-\d{2}")).sum()
 vc_no_date   = total - vc_has_date
 
+# Remarks-based boolean masks
+remarks_str   = df["Remarks"].astype(str).str.strip()
+is_jibe_mask  = remarks_str.str.contains(
+    r"hasn.t been rolled out|not rolled out|jibe", case=False, na=False, regex=True
+)
+is_na_mask    = (
+    df["Remarks"].isna() |
+    (remarks_str == "") |
+    (remarks_str.str.lower() == "nan") |
+    (remarks_str.str.lower() == "n/a") |
+    (remarks_str.str.lower() == "na")
+)
+n_not_jibe    = int(is_jibe_mask.sum())
+n_remarks_na  = int(is_na_mask.sum())
+
+# Fleet Health — denominator excludes Jibe-not-rolled-out and NA-remarks vessels
+active_mask   = ~is_jibe_mask & ~is_na_mask
+active_fleet  = int(active_mask.sum())
+n_uptodate_active = int(((df["Status"] == "Up-to-date") & active_mask).sum())
+health_pct    = round(n_uptodate_active / active_fleet * 100, 1) if active_fleet else 0
+
+# Unique Remarks values for sidebar filter (non-null, sorted)
+remarks_opts_raw = df["Remarks"].dropna().astype(str).str.strip()
+remarks_opts_raw = remarks_opts_raw[~remarks_opts_raw.str.lower().isin(["", "nan", "n/a", "na"])]
+remarks_opts = sorted(remarks_opts_raw.unique().tolist())
+
+# VesselCheck date series and month-year labels for filter/chart
+vc_date_dt_series = pd.to_datetime(df["VesselCheck"], errors="coerce")
+vc_month_series   = vc_date_dt_series.dt.to_period("M")
+# Format as "Jan 2026" for display
+vc_month_labels_sorted = sorted(vc_month_series.dropna().unique().tolist(), key=lambda p: p.ordinal)
+vc_month_display  = [p.strftime("%b %Y") for p in vc_month_labels_sorted]
+# Map "Jan 2026" -> Period for reverse lookup
+vc_display_to_period = {p.strftime("%b %Y"): p for p in vc_month_labels_sorted}
+
 # ── Sidebar filters ───────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
 status_opts = df["Status"].dropna().unique().tolist()
 sel_status  = st.sidebar.multiselect("Status", status_opts, default=status_opts)
-vc_vals     = df["VesselCheck"].dropna().unique().tolist()
-sel_vc      = st.sidebar.multiselect("VesselCheck", vc_vals, default=vc_vals)
-search      = st.sidebar.text_input("Search vessel", "")
+vessel_opts = sorted(df["Vessel"].dropna().astype(str).unique().tolist())
+sel_vessels = st.sidebar.multiselect("Vessel", options=vessel_opts, default=[],
+                                     help="Leave blank to include all vessels")
 
-mask = df["Status"].isin(sel_status) & df["VesselCheck"].isin(sel_vc)
-if search:
-    mask &= df["Vessel"].astype(str).str.contains(search, case=False, na=False)
+st.sidebar.markdown("**Remarks**")
+include_na_remarks = st.sidebar.checkbox("Include vessels with no Remarks (NA)", value=True)
+sel_remarks = st.sidebar.multiselect(
+    "Filter by Remarks",
+    options=remarks_opts,
+    default=[],
+    help="Leave blank to include all; select specific remarks to filter to those only",
+)
+
+st.sidebar.markdown("**VesselCheck Date Range**")
+vc_valid_dates = vc_date_dt_series.dropna()
+if not vc_valid_dates.empty:
+    vc_min_date = vc_valid_dates.min().date()
+    vc_max_date = vc_valid_dates.max().date()
+    import datetime as _dt
+    vc_date_from = st.sidebar.date_input(
+        "From", value=vc_min_date,
+        min_value=vc_min_date, max_value=vc_max_date, key="vc_from"
+    )
+    vc_date_to = st.sidebar.date_input(
+        "To", value=vc_max_date,
+        min_value=vc_min_date, max_value=vc_max_date, key="vc_to"
+    )
+    sel_vc_months = [
+        lbl for lbl, p in vc_display_to_period.items()
+        if _dt.date(p.year, p.month, 1) >= _dt.date(vc_date_from.year, vc_date_from.month, 1)
+        and _dt.date(p.year, p.month, 1) <= _dt.date(vc_date_to.year, vc_date_to.month, 1)
+    ]
+else:
+    vc_date_from = vc_date_to = None
+    sel_vc_months = []
+
+mask = df["Status"].isin(sel_status)
+if sel_vessels:
+    mask &= df["Vessel"].astype(str).isin(sel_vessels)
+if sel_remarks:
+    remark_match = df["Remarks"].astype(str).str.strip().isin(sel_remarks)
+    if include_na_remarks:
+        remark_match |= (
+            df["Remarks"].isna() |
+            (df["Remarks"].astype(str).str.strip().str.lower().isin(["", "nan", "n/a", "na"]))
+        )
+    mask &= remark_match
+if sel_vc_months:
+    sel_periods = set(vc_display_to_period[lbl] for lbl in sel_vc_months if lbl in vc_display_to_period)
+    vc_month_mask = vc_month_series.isin(sel_periods) | vc_month_series.isna()
+    mask &= vc_month_mask
 filtered = df[mask].copy()
 
 st.sidebar.divider()
@@ -227,12 +305,23 @@ st.divider()
 
 # ── KPI cards ─────────────────────────────────────────────────────────────────
 st.markdown("### Fleet Overview")
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total Vessels",    total)
-k2.metric("Fleet Health",     f"{health_pct}%", help="% vessels with report ≤ 89 days")
-k3.metric("Up-to-date",       n_uptodate)
-k4.metric("Overdue",          n_overdue)
-k5.metric("No Report Date",   n_nodate)
+
+# Row 1 — Vessel count breakdown
+r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
+r1c1.metric("Total Vessels",                       total)
+r1c2.metric("Hasn't been rolled out with Jibe",    n_not_jibe,
+            help="Vessels whose Remarks contain 'hasn't been rolled out', 'not rolled out', or 'jibe'")
+r1c3.metric("Remarks — NA",                        n_remarks_na,
+            help="Vessels with no remark recorded (blank / NA / N/A)")
+r1c4.metric("Fleet Health",                        f"{health_pct}%",
+            help="% vessels with report ≤ 89 days")
+r1c5.metric("No Report Date",                      n_nodate)
+
+# Row 2 — Report status
+r2c1, r2c2, r2c3 = st.columns(3)
+r2c1.metric("Up-to-date",  n_uptodate)
+r2c2.metric("Overdue",     n_overdue)
+r2c3.metric("No Date",     n_nodate)
 
 st.markdown("#### Overdue Severity")
 s1, s2, s3 = st.columns(3)
@@ -302,7 +391,7 @@ with ch3:
     st.plotly_chart(fig_monthly, use_container_width=True)
 
 with ch4:
-    # VesselCheck compliance
+    # VesselCheck compliance pie
     vc_data = pd.DataFrame({
         "Category": ["Has VesselCheck Date", "No VesselCheck Date"],
         "Count": [vc_has_date, vc_no_date],
@@ -317,20 +406,109 @@ with ch4:
     fig_vc.update_traces(textinfo="percent+label")
     st.plotly_chart(fig_vc, use_container_width=True)
 
-# ── Top overdue bar ───────────────────────────────────────────────────────────
-overdue_df = df[df["Status"] == "Overdue"].sort_values("Days Since Report", ascending=False)
-if not overdue_df.empty:
-    st.markdown("### Top Overdue Vessels")
-    fig_over = px.bar(
-        overdue_df.head(20),
-        x="Vessel", y="Days Since Report",
-        color="Overdue Bucket",
-        color_discrete_map={"90–180 days": "#f39c12", "181–210 days": "#e67e22", "210+ days": "#e74c3c"},
+# ── VesselCheck by Month ───────────────────────────────────────────────────────
+st.markdown("### VesselCheck by Month")
+
+# Build month series using only the selected period range
+if sel_vc_months:
+    sel_periods_chart = set(vc_display_to_period[lbl] for lbl in sel_vc_months if lbl in vc_display_to_period)
+    vc_monthly_filtered = vc_month_series[vc_month_series.isin(sel_periods_chart)]
+else:
+    vc_monthly_filtered = vc_month_series.dropna()
+
+# Aggregate: count vessels per month, format label as "Mon YYYY"
+vc_by_month = (
+    vc_monthly_filtered
+    .value_counts()
+    .sort_index()
+    .reset_index()
+)
+vc_by_month.columns = ["Period", "Vessels"]
+vc_by_month["Month"] = vc_by_month["Period"].apply(lambda p: p.strftime("%b %Y"))
+
+if vc_by_month.empty:
+    st.info("No VesselCheck dates available for the selected date range.")
+else:
+    fig_vc_month = px.bar(
+        vc_by_month, x="Month", y="Vessels",
+        title="Number of Vessels with VesselCheck by Month",
         text_auto=True,
-        title="Top 20 Overdue Vessels (coloured by severity)",
+        color_discrete_sequence=["#1abc9c"],
+        category_orders={"Month": vc_by_month["Month"].tolist()},
     )
-    fig_over.update_layout(xaxis_tickangle=-35, yaxis_title="Days Since Last Report",
-                           legend_title="Severity")
+    fig_vc_month.update_layout(
+        xaxis_type="category",
+        xaxis_tickangle=-35,
+        yaxis_title="Vessel Count",
+        xaxis_title="VesselCheck Month",
+    )
+    st.plotly_chart(fig_vc_month, use_container_width=True)
+
+    with st.expander("📅 VesselCheck Month Detail Table"):
+        if sel_vc_months:
+            vc_detail_mask = vc_month_series.isin(sel_periods_chart)
+        else:
+            vc_detail_mask = vc_month_series.notna()
+        vc_detail = df[vc_detail_mask][
+            ["Vessel", "VesselCheck", "Status", "Remarks"]
+        ].sort_values("VesselCheck")
+        st.dataframe(vc_detail, use_container_width=True)
+
+# ── Vessel report status bar (overdue + up-to-date, respects filters) ─────────
+overdue_df   = filtered[filtered["Status"] == "Overdue"].copy()
+uptodate_df  = filtered[filtered["Status"] == "Up-to-date"].copy()
+
+overdue_df["Bar Value"]  = overdue_df["Days Since Report"].astype(float)
+overdue_df["Label"]      = overdue_df["Overdue Bucket"].fillna("Overdue")
+overdue_df["Bar Type"]   = "Overdue"
+
+uptodate_df["Days Left"] = 89 - uptodate_df["Days Since Report"].astype(float)
+uptodate_df["Bar Value"] = uptodate_df["Days Left"]
+uptodate_df["Label"]     = "Up-to-date"
+uptodate_df["Bar Type"]  = "Up-to-date"
+
+# Top 20 overdue (worst first) + top 20 soonest-expiring up-to-date
+top_overdue   = overdue_df.sort_values("Bar Value", ascending=False).head(20)
+top_uptodate  = uptodate_df.sort_values("Days Left", ascending=True).head(20)
+bar_df = pd.concat([top_overdue, top_uptodate], ignore_index=True)
+
+if not bar_df.empty:
+    st.markdown("### Vessel Report Status")
+    color_map = {
+        "90–180 days":   "#f39c12",
+        "181–210 days":  "#e67e22",
+        "210+ days":     "#e74c3c",
+        "Overdue":       "#e74c3c",
+        "Up-to-date":    "#2ecc71",
+    }
+    fig_over = px.bar(
+        bar_df.sort_values("Bar Value", ascending=False),
+        x="Vessel", y="Bar Value",
+        color="Label",
+        color_discrete_map=color_map,
+        text_auto=True,
+        title=(
+            f"Overdue vessels (days since report) & "
+            f"Up-to-date vessels (days left before overdue) — "
+            f"{len(overdue_df)} overdue / {len(uptodate_df)} up-to-date in current filter"
+        ),
+        labels={"Bar Value": "Days", "Label": "Status"},
+        custom_data=["Status", "Days Since Report", "Days Left"] if "Days Left" in bar_df.columns else ["Status"],
+    )
+    fig_over.update_traces(
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            "Status: %{customdata[0]}<br>"
+            "Days since report: %{customdata[1]}<br>"
+            "Days left: %{customdata[2]}<extra></extra>"
+        )
+    )
+    fig_over.update_layout(
+        xaxis_tickangle=-35,
+        yaxis_title="Days",
+        legend_title="Status",
+        bargap=0.15,
+    )
     st.plotly_chart(fig_over, use_container_width=True)
 
 st.divider()
@@ -358,28 +536,3 @@ with st.expander("🚫 Vessels with No Report Date"):
         st.warning(f"{len(no_date_df)} vessel(s) have no Latest Report Date.")
         st.dataframe(no_date_df, use_container_width=True)
 
-# ── Remarks summary ───────────────────────────────────────────────────────────
-with st.expander("📝 Remarks Summary"):
-    remarks_df = filtered[["Vessel", "Status", "Remarks"]].dropna(subset=["Remarks"])
-    remarks_df = remarks_df[remarks_df["Remarks"].astype(str).str.strip().ne("")]
-    if remarks_df.empty:
-        st.write("No remarks to display for current filter.")
-    else:
-        st.dataframe(remarks_df, use_container_width=True)
-
-        # Top recurring words in remarks
-        all_remarks = " ".join(remarks_df["Remarks"].astype(str).str.lower())
-        stop = {"the","a","an","and","or","of","to","in","is","it","for","on",
-                "with","at","by","from","as","was","are","has","have","been",
-                "this","that","not","no","n/a","nan","be","will"}
-        words = [w.strip(".,;:()") for w in all_remarks.split() if len(w) > 3 and w not in stop]
-        if words:
-            word_freq = pd.Series(words).value_counts().head(15).reset_index()
-            word_freq.columns = ["Word", "Frequency"]
-            fig_words = px.bar(
-                word_freq, x="Frequency", y="Word", orientation="h",
-                title="Top 15 Words in Remarks",
-                color_discrete_sequence=["#8e44ad"],
-            )
-            fig_words.update_layout(yaxis=dict(autorange="reversed"))
-            st.plotly_chart(fig_words, use_container_width=True)
