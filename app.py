@@ -29,15 +29,15 @@ if not uploaded:
     st.markdown("### Status Logic & Colour Guide")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.success("🟢 **Up-to-date**\nLatest Report Date is within the last **89 days**.\nRow highlighted **green**.")
+        st.success("🟢 **Up-to-date**\nLatest Report Date is within the last **120 days**.\nRow highlighted **green**.")
     with col2:
-        st.error("🔴 **Overdue**\nLatest Report Date is **more than 89 days** ago.\nRow highlighted **red**.")
+        st.error("🔴 **Overdue**\nLatest Report Date is **more than 120 days** ago.\nRow highlighted **red**.")
     with col3:
         st.warning("⚪ **No Date**\nNo Latest Report Date recorded.\nRow left **un-highlighted**.")
 
     st.markdown("#### Overdue Severity Buckets")
     b1, b2, b3 = st.columns(3)
-    b1.info("🟡 **90–180 days** — Attention needed")
+    b1.info("🟡 **120–180 days** — Attention needed")
     b2.warning("🟠 **181–210 days** — Escalate")
     b3.error("🔴 **210+ days** — Critical")
 
@@ -45,8 +45,8 @@ if not uploaded:
     st.markdown("""
 | Analysis | What it shows |
 |---|---|
-| **Fleet Health Score** | % of vessels with reports submitted within 89 days |
-| **Overdue Severity Breakdown** | Buckets: 90–180 / 181–210 / 210+ days overdue |
+| **Fleet Health Score** | % of vessels with reports submitted within 120 days |
+| **Overdue Severity Breakdown** | Buckets: 120–180 / 181–210 / 210+ days overdue |
 | **VesselCheck Compliance** | How many vessels have a valid VesselCheck date |
 | **Reporting Activity by Month** | Count of reports submitted per calendar month |
 | **Vessels Never Reported** | Vessels with no date at all |
@@ -151,15 +151,15 @@ df["Days Since Report"] = (today - report_date_dt).dt.days.astype("Int64")
 def classify_status(d):
     if pd.isna(d):
         return "No Date"
-    return "Up-to-date" if d <= 89 else "Overdue"
+    return "Up-to-date" if d <= 120 else "Overdue"
 
 df["Status"] = df["Days Since Report"].apply(classify_status)
 
 def overdue_bucket(d):
-    if pd.isna(d) or d <= 89:
+    if pd.isna(d) or d <= 120:
         return None
     if d <= 180:
-        return "90–180 days"
+        return "120–180 days"
     if d <= 210:
         return "181–210 days"
     return "210+ days"
@@ -177,7 +177,7 @@ n_uptodate = (df["Status"] == "Up-to-date").sum()
 n_overdue  = (df["Status"] == "Overdue").sum()
 n_nodate   = (df["Status"] == "No Date").sum()
 
-n_31_60 = (df["Overdue Bucket"] == "90–180 days").sum()
+n_31_60 = (df["Overdue Bucket"] == "120–180 days").sum()
 n_61_90 = (df["Overdue Bucket"] == "181–210 days").sum()
 n_90p   = (df["Overdue Bucket"] == "210+ days").sum()
 
@@ -289,15 +289,15 @@ st.sidebar.download_button("Download filtered CSV", csv_buf,
 with st.expander("📖 Status Logic & Colour Guide", expanded=False):
     lg1, lg2, lg3 = st.columns(3)
     with lg1:
-        st.success("🟢 **Up-to-date**\nReport within **≤ 89 days**.\nRow highlighted **green**.")
+        st.success("🟢 **Up-to-date**\nReport within **≤ 120 days**.\nRow highlighted **green**.")
     with lg2:
-        st.error("🔴 **Overdue**\nReport **> 89 days** ago.\nRow highlighted **red**.")
+        st.error("🔴 **Overdue**\nReport **> 120 days** ago.\nRow highlighted **red**.")
     with lg3:
         st.warning("⚪ **No Date**\nNo report date recorded.\nRow un-highlighted.")
 
     st.markdown("**Overdue Severity Buckets:**")
     b1, b2, b3 = st.columns(3)
-    b1.info("🟡 **90–180 days** — Attention needed")
+    b1.info("🟡 **120–180 days** — Attention needed")
     b2.warning("🟠 **181–210 days** — Escalate")
     b3.error("🔴 **210+ days** — Critical")
 
@@ -314,7 +314,7 @@ r1c2.metric("Hasn't been rolled out with Jibe",    n_not_jibe,
 r1c3.metric("Remarks — NA",                        n_remarks_na,
             help="Vessels with no remark recorded (blank / NA / N/A)")
 r1c4.metric("Fleet Health",                        f"{health_pct}%",
-            help="% vessels with report ≤ 89 days")
+            help="% active vessels with report ≤ 120 days")
 r1c5.metric("No Report Date",                      n_nodate)
 
 # Row 2 — Report status
@@ -325,7 +325,7 @@ r2c3.metric("No Date",     n_nodate)
 
 st.markdown("#### Overdue Severity")
 s1, s2, s3 = st.columns(3)
-s1.metric("90–180 days (Attention)", n_31_60)
+s1.metric("120–180 days (Attention)", n_31_60)
 s2.metric("181–210 days (Escalate)", n_61_90)
 s3.metric("210+ days (Critical)",    n_90p)
 
@@ -348,8 +348,8 @@ with ch1:
     st.plotly_chart(fig_pie, use_container_width=True)
 
 with ch2:
-    bucket_order = ["90–180 days", "181–210 days", "210+ days"]
-    bucket_colors = {"90–180 days": "#f39c12", "181–210 days": "#e67e22", "210+ days": "#e74c3c"}
+    bucket_order = ["120–180 days", "181–210 days", "210+ days"]
+    bucket_colors = {"120–180 days": "#f39c12", "181–210 days": "#e67e22", "210+ days": "#e74c3c"}
     overdue_buckets = (
         df[df["Overdue Bucket"].notna()]["Overdue Bucket"]
         .value_counts()
@@ -462,7 +462,7 @@ overdue_df["Bar Value"]  = overdue_df["Days Since Report"].astype(float)
 overdue_df["Label"]      = overdue_df["Overdue Bucket"].fillna("Overdue")
 overdue_df["Bar Type"]   = "Overdue"
 
-uptodate_df["Days Left"] = 89 - uptodate_df["Days Since Report"].astype(float)
+uptodate_df["Days Left"] = 120 - uptodate_df["Days Since Report"].astype(float)
 uptodate_df["Bar Value"] = uptodate_df["Days Left"]
 uptodate_df["Label"]     = "Up-to-date"
 uptodate_df["Bar Type"]  = "Up-to-date"
@@ -475,7 +475,7 @@ bar_df = pd.concat([top_overdue, top_uptodate], ignore_index=True)
 if not bar_df.empty:
     st.markdown("### Vessel Report Status")
     color_map = {
-        "90–180 days":   "#f39c12",
+        "120–180 days":  "#f39c12",
         "181–210 days":  "#e67e22",
         "210+ days":     "#e74c3c",
         "Overdue":       "#e74c3c",
