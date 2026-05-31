@@ -68,7 +68,7 @@ def load_file(file_bytes, filename):
     sheet = next((s for s in sheets if s.strip().lower() == TARGET_SHEET.lower()), None)
     if sheet is None:
         return None, sheets
-    df = xf.parse(sheet)
+    df = xf.parse(sheet, keep_default_na=False, na_values=[""])
     df.columns = df.columns.str.strip()
     df = df.dropna(how="all")
     return df, sheet
@@ -142,6 +142,9 @@ df = pd.DataFrame({
     "VesselCheck":        df[col_vessel_check],
 })
 
+# Drop ghost rows: no vessel name (NaN, blank, or whitespace-only)
+df = df[df["Vessel"].notna() & (df["Vessel"].astype(str).str.strip() != "")].reset_index(drop=True)
+
 report_date_dt  = pd.to_datetime(df["Latest Report Date"], errors="coerce").dt.normalize()
 vc_date_dt      = pd.to_datetime(df["VesselCheck"],        errors="coerce").dt.normalize()
 today           = pd.Timestamp(date.today())
@@ -184,31 +187,42 @@ n_90p   = (df["Overdue Bucket"] == "210+ days").sum()
 vc_has_date  = (df["VesselCheck"].str.match(r"\d{4}-\d{2}-\d{2}")).sum()
 vc_no_date   = total - vc_has_date
 
-# Remarks-based boolean masks
-remarks_str   = df["Remarks"].astype(str).str.strip()
-is_jibe_mask  = remarks_str.str.contains(
+# ── Normalise Remarks → clean strings, then classify ─────────────────────────
+# "Blank" = empty/NaN cells   "NA" = literal "NA"/"N/A"/dash/null text
+_NA_TEXT_VALUES = {
+    "na", "n/a", "n.a.", "n.a", "nan", "none", "null",
+    "-", "–", "—", ".", "0", "nil", "not applicable", "not available",
+}
+# 1. Strip whitespace; NaN → "" (empty string)
+_remarks_clean  = df["Remarks"].fillna("").astype(str).str.strip()
+# 2. Classify
+is_blank_mask   = (_remarks_clean == "")
+is_na_text_mask = _remarks_clean.str.lower().isin(_NA_TEXT_VALUES) & ~is_blank_mask
+is_na_mask      = is_blank_mask | is_na_text_mask   # combined for fleet-health
+# 3. Write display values: blank→"Blank", NA text→"NA", everything else unchanged
+df["Remarks"] = _remarks_clean.copy()
+df.loc[is_blank_mask,   "Remarks"] = "Blank"
+df.loc[is_na_text_mask, "Remarks"] = "NA"
+
+# 4. Jibe mask — operates on clean column (Blank/NA rows never contain jibe text)
+is_jibe_mask = df["Remarks"].str.contains(
     r"hasn.t been rolled out|not rolled out|jibe", case=False, na=False, regex=True
 )
-is_na_mask    = (
-    df["Remarks"].isna() |
-    (remarks_str == "") |
-    (remarks_str.str.lower() == "nan") |
-    (remarks_str.str.lower() == "n/a") |
-    (remarks_str.str.lower() == "na")
-)
-n_not_jibe    = int(is_jibe_mask.sum())
-n_remarks_na  = int(is_na_mask.sum())
 
-# Fleet Health — denominator excludes Jibe-not-rolled-out and NA-remarks vessels
-active_mask   = ~is_jibe_mask & ~is_na_mask
-active_fleet  = int(active_mask.sum())
+n_remarks_blank = int(is_blank_mask.sum())
+n_remarks_na    = int(is_na_text_mask.sum())
+n_not_jibe      = int(is_jibe_mask.sum())
+n_other         = int((~is_na_mask & ~is_jibe_mask).sum())
+# Sanity: n_remarks_blank + n_remarks_na + n_not_jibe + n_other == total
+
+# Fleet Health — denominator excludes Jibe and Blank/NA-remarks vessels
+active_mask       = ~is_jibe_mask & ~is_na_mask
+active_fleet      = int(active_mask.sum())
 n_uptodate_active = int(((df["Status"] == "Up-to-date") & active_mask).sum())
-health_pct    = round(n_uptodate_active / active_fleet * 100, 1) if active_fleet else 0
+health_pct        = round(n_uptodate_active / active_fleet * 100, 1) if active_fleet else 0
 
-# Unique Remarks values for sidebar filter (non-null, sorted)
-remarks_opts_raw = df["Remarks"].dropna().astype(str).str.strip()
-remarks_opts_raw = remarks_opts_raw[~remarks_opts_raw.str.lower().isin(["", "nan", "n/a", "na"])]
-remarks_opts = sorted(remarks_opts_raw.unique().tolist())
+# Unique Remarks values for sidebar filter — exclude Blank/NA (handled by checkbox)
+remarks_opts = sorted(df.loc[~is_na_mask, "Remarks"].unique().tolist())
 
 # VesselCheck date series and month-year labels for filter/chart
 vc_date_dt_series = pd.to_datetime(df["VesselCheck"], errors="coerce")
@@ -228,9 +242,10 @@ sel_vessels = st.sidebar.multiselect("Vessel", options=vessel_opts, default=[],
                                      help="Leave blank to include all vessels")
 
 st.sidebar.markdown("**Remarks**")
-include_na_remarks = st.sidebar.checkbox("Include vessels with no Remarks (NA)", value=True)
+include_blank_remarks = st.sidebar.checkbox("Include Blank remarks", value=True)
+include_na_remarks    = st.sidebar.checkbox("Include NA remarks", value=True)
 sel_remarks = st.sidebar.multiselect(
-    "Filter by Remarks",
+    "Filter by specific Remarks",
     options=remarks_opts,
     default=[],
     help="Leave blank to include all; select specific remarks to filter to those only",
@@ -262,14 +277,19 @@ else:
 mask = df["Status"].isin(sel_status)
 if sel_vessels:
     mask &= df["Vessel"].astype(str).isin(sel_vessels)
-if sel_remarks:
-    remark_match = df["Remarks"].astype(str).str.strip().isin(sel_remarks)
-    if include_na_remarks:
-        remark_match |= (
-            df["Remarks"].isna() |
-            (df["Remarks"].astype(str).str.strip().str.lower().isin(["", "nan", "n/a", "na"]))
-        )
-    mask &= remark_match
+if sel_remarks or not include_blank_remarks or not include_na_remarks:
+    if sel_remarks:
+        remark_match = df["Remarks"].isin(sel_remarks)
+        if include_blank_remarks:
+            remark_match |= (df["Remarks"] == "Blank")
+        if include_na_remarks:
+            remark_match |= (df["Remarks"] == "NA")
+        mask &= remark_match
+    else:
+        if not include_blank_remarks:
+            mask &= (df["Remarks"] != "Blank")
+        if not include_na_remarks:
+            mask &= (df["Remarks"] != "NA")
 if sel_vc_months:
     sel_periods = set(vc_display_to_period[lbl] for lbl in sel_vc_months if lbl in vc_display_to_period)
     vc_month_mask = vc_month_series.isin(sel_periods) | vc_month_series.isna()
@@ -307,21 +327,56 @@ st.divider()
 st.markdown("### Fleet Overview")
 
 # Row 1 — Vessel count breakdown
-r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
+r1c1, r1c2, r1c3, r1c4, r1c5, r1c6 = st.columns(6)
 r1c1.metric("Total Vessels",                       total)
 r1c2.metric("Hasn't been rolled out with Jibe",    n_not_jibe,
             help="Vessels whose Remarks contain 'hasn't been rolled out', 'not rolled out', or 'jibe'")
 r1c3.metric("Remarks — NA",                        n_remarks_na,
-            help="Vessels with no remark recorded (blank / NA / N/A)")
-r1c4.metric("Fleet Health",                        f"{health_pct}%",
+            help="Vessels with literal 'NA', 'N/A', 'none', '-' etc. in the Remarks cell")
+r1c4.metric("Remarks — Blank",                     n_remarks_blank,
+            help="Vessels where the Remarks cell is empty")
+r1c5.metric("Fleet Health",                        f"{health_pct}%",
             help="% active vessels with report ≤ 120 days")
-r1c5.metric("No Report Date",                      n_nodate)
+r1c6.metric("No Report Date",                      n_nodate)
+
+st.info(
+    f"**Fleet Health formula:** "
+    f"{n_uptodate_active} up-to-date (active) ÷ {active_fleet} active vessels × 100 = **{health_pct}%**  \n"
+    f"Active fleet = {total} total − {n_not_jibe} Jibe − {n_remarks_na} NA − {n_remarks_blank} Blank = **{active_fleet}**  \n"
+    f"ℹ️ The *Up-to-date* KPI above shows **{n_uptodate}** (all vessels reported within 120 days, including Jibe / NA / Blank). "
+    f"Fleet Health uses only the **{n_uptodate_active}** within the active fleet — difference of {n_uptodate - n_uptodate_active}."
+)
 
 # Row 2 — Report status
 r2c1, r2c2, r2c3 = st.columns(3)
 r2c1.metric("Up-to-date",  n_uptodate)
 r2c2.metric("Overdue",     n_overdue)
 r2c3.metric("No Date",     n_nodate)
+
+with st.expander("🔍 Remarks Breakdown — all remarks with counts (total = vessel count)"):
+    # Full frequency table: every unique Remark value → count, sorted desc, with Total row
+    remarks_freq = (
+        df["Remarks"]
+        .value_counts()
+        .reset_index()
+    )
+    remarks_freq.columns = ["Remark", "Count"]
+    total_row = pd.DataFrame([{"Remark": "TOTAL", "Count": remarks_freq["Count"].sum()}])
+    remarks_table = pd.concat([remarks_freq, total_row], ignore_index=True)
+    st.dataframe(
+        remarks_table.style.apply(
+            lambda row: ["font-weight: bold; background-color: #f0f0f0"] * len(row)
+            if row["Remark"] == "TOTAL" else [""] * len(row),
+            axis=1,
+        ),
+        use_container_width=True,
+        height=min(400, 35 * (len(remarks_table) + 1) + 40),
+    )
+    st.caption(
+        "**Blank** = empty cell in the sheet &nbsp;|&nbsp; "
+        "**NA** = cell contains 'NA', 'N/A', 'none', '-' or similar &nbsp;|&nbsp; "
+        "All other values are shown as-is."
+    )
 
 st.markdown("#### Overdue Severity")
 s1, s2, s3 = st.columns(3)
