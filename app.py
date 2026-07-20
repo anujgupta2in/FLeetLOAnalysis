@@ -4,6 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date
 import io
+import os
+import glob
 
 st.set_page_config(
     page_title="Fleet Summary Analyser",
@@ -14,12 +16,34 @@ st.set_page_config(
 st.title("🚢 Fleet Summary Analyser")
 st.markdown("Upload your Fleet Summary Excel file to analyse LO report status across vessels.")
 
-# ── File upload ───────────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "Upload Fleet Summary File",
-    type=["xlsx", "xls", "csv"],
-    help="Supports Excel (.xlsx / .xls) and CSV files",
-)
+# ── File source ───────────────────────────────────────────────────────────────
+# Look for pre-uploaded master files in attached_assets/
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "attached_assets")
+_master_files = sorted(glob.glob(os.path.join(_ASSET_DIR, "Master_Sheet_*.xlsx")), reverse=True)
+
+up_col, btn_col = st.columns([3, 1])
+with up_col:
+    uploaded = st.file_uploader(
+        "Upload Fleet Summary File",
+        type=["xlsx", "xls", "csv"],
+        help="Supports Excel (.xlsx / .xls) and CSV files",
+    )
+with btn_col:
+    if _master_files:
+        latest_master = _master_files[0]
+        st.markdown("&nbsp;")   # vertical spacing
+        if st.button("📂 Load Master File", use_container_width=True,
+                     help=f"Load: {os.path.basename(latest_master)}"):
+            with open(latest_master, "rb") as _f:
+                st.session_state["_master_bytes"] = _f.read()
+                st.session_state["_master_name"]  = os.path.basename(latest_master)
+
+# Use session-state master file if no manual upload
+if not uploaded and st.session_state.get("_master_bytes"):
+    _bytes = st.session_state["_master_bytes"]
+    _name  = st.session_state["_master_name"]
+    uploaded = io.BytesIO(_bytes)
+    uploaded.name = _name
 
 if not uploaded:
     st.info("👆 Upload a Fleet Summary file to get started.")
@@ -118,6 +142,7 @@ col_report_date  = find_col(df, ["latest report date", "report date", "last repo
                                 partial_hints=["latest report", "report date", "last report", "date"])
 col_remarks      = find_col(df, ["remarks", "remark"],           partial_hints=["remark"])
 col_vessel_check = find_col(df, ["vesselcheck", "vessel check"], partial_hints=["vesselcheck", "vessel check", "check"])
+col_fleet        = find_col(df, ["fleet"],                       partial_hints=["fleet"])
 
 missing = [name for name, c in [
     ("Vessel", col_vessel), ("Latest Report Date", col_report_date),
@@ -137,6 +162,7 @@ if missing:
 # ── Normalise ─────────────────────────────────────────────────────────────────
 df = pd.DataFrame({
     "Vessel":             df[col_vessel],
+    "Fleet":              df[col_fleet] if col_fleet else "",
     "Latest Report Date": df[col_report_date],
     "Remarks":            df[col_remarks],
     "VesselCheck":        df[col_vessel_check],
@@ -298,7 +324,7 @@ filtered = df[mask].copy()
 
 st.sidebar.divider()
 st.sidebar.markdown("**Export**")
-display_cols = ["Vessel", "Latest Report Date", "Days Since Report",
+display_cols = ["Vessel", "Fleet", "Latest Report Date", "Days Since Report",
                 "Status", "Overdue Bucket", "VesselCheck", "Remarks"]
 display_cols = [c for c in display_cols if c in filtered.columns]
 csv_buf = filtered[display_cols].to_csv(index=False).encode()
