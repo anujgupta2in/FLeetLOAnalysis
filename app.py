@@ -1,11 +1,15 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, date
+from datetime import date
 import io
 import os
 import glob
+
+# Report is "Up-to-date" if Days Since Report <= this value
+UPTODATE_DAYS = 120
+BUCKET_ORDER  = ["120–180 days", "181–210 days", "210+ days"]
 
 st.set_page_config(
     page_title="Fleet Summary Analyser",
@@ -81,48 +85,38 @@ if not uploaded:
 # ── Parse ─────────────────────────────────────────────────────────────────────
 TARGET_SHEET = "Fleet Summary"
 
+# keep_default_na=False so literal "NA" text in Remarks is kept (not turned into blank)
+_READ_OPTS = dict(keep_default_na=False, na_values=[""])
+
+def _clean(df):
+    df.columns = df.columns.astype(str).str.strip()
+    return df.dropna(how="all").reset_index(drop=True)
+
 @st.cache_data(show_spinner="Reading file…")
-def load_file(file_bytes, filename):
-    if filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes))
-        df.columns = df.columns.str.strip()
-        return df, None
-    xf = pd.ExcelFile(io.BytesIO(file_bytes))
-    sheets = xf.sheet_names
-    sheet = next((s for s in sheets if s.strip().lower() == TARGET_SHEET.lower()), None)
-    if sheet is None:
-        return None, sheets
-    df = xf.parse(sheet, keep_default_na=False, na_values=[""])
-    df.columns = df.columns.str.strip()
-    df = df.dropna(how="all")
-    return df, sheet
+def list_sheets(file_bytes):
+    return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+
+@st.cache_data(show_spinner="Reading sheet…")
+def load_data(file_bytes, filename, sheet=None):
+    if filename.lower().endswith(".csv"):
+        return _clean(pd.read_csv(io.BytesIO(file_bytes), **_READ_OPTS))
+    return _clean(pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, **_READ_OPTS))
 
 try:
-    raw_bytes = uploaded.read()
-    df, sheet_info = load_file(raw_bytes, uploaded.name)
+    raw_bytes = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+    sheet = None
+    if not uploaded.name.lower().endswith(".csv"):
+        sheets = list_sheets(raw_bytes)
+        sheet = next((s for s in sheets if s.strip().lower() == TARGET_SHEET.lower()), None)
+        if sheet is None:
+            sheet = st.selectbox(
+                f'Sheet **"{TARGET_SHEET}"** not found. Select the correct sheet:', sheets)
+        else:
+            st.caption(f"Sheet loaded: **{sheet}**")
+    df = load_data(raw_bytes, uploaded.name, sheet)
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
-
-if df is None:
-    available_sheets = sheet_info
-    chosen = st.selectbox(
-        f'Sheet **"{TARGET_SHEET}"** not found. Select the correct sheet:',
-        available_sheets,
-    )
-    @st.cache_data(show_spinner="Reading sheet…")
-    def load_sheet(file_bytes, sheet):
-        xf = pd.ExcelFile(io.BytesIO(file_bytes))
-        df = xf.parse(sheet)
-        df.columns = df.columns.str.strip()
-        df = df.dropna(how="all")
-        return df
-    df = load_sheet(raw_bytes, chosen)
-else:
-    if isinstance(sheet_info, str):
-        st.caption(f"Sheet loaded: **{sheet_info}**")
-
-df = df.dropna(how="all").reset_index(drop=True)
 
 # ── Column mapping ────────────────────────────────────────────────────────────
 def find_col(df, exact_hints, partial_hints=None):
@@ -143,6 +137,8 @@ col_report_date  = find_col(df, ["latest report date", "report date", "last repo
 col_remarks      = find_col(df, ["remarks", "remark"],           partial_hints=["remark"])
 col_vessel_check = find_col(df, ["vesselcheck", "vessel check"], partial_hints=["vesselcheck", "vessel check", "check"])
 col_fleet        = find_col(df, ["fleet"],                       partial_hints=["fleet"])
+col_vendor       = find_col(df, ["vendor", "vendor name", "lo vendor", "supplier"],
+                                partial_hints=["vendor", "supplier"])
 
 missing = [name for name, c in [
     ("Vessel", col_vessel), ("Latest Report Date", col_report_date),
@@ -152,17 +148,28 @@ missing = [name for name, c in [
 if missing:
     st.warning(f"Could not auto-detect columns: **{', '.join(missing)}**. Please map them below.")
     all_cols = list(df.columns)
+    opt_cols = ["(none)"] + all_cols
+    def _opt_index(c):
+        return opt_cols.index(c) if c in opt_cols else 0
     with st.expander("Map columns manually", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         col_vessel       = c1.selectbox("Vessel column",             all_cols, index=0)
         col_report_date  = c2.selectbox("Latest Report Date column", all_cols, index=min(1, len(all_cols)-1))
         col_remarks      = c3.selectbox("Remarks column",            all_cols, index=min(2, len(all_cols)-1))
         col_vessel_check = c4.selectbox("VesselCheck column",        all_cols, index=min(3, len(all_cols)-1))
+        col_fleet        = c5.selectbox("Fleet column (optional)",   opt_cols, index=_opt_index(col_fleet))
+        col_vendor       = c6.selectbox("Vendor column (optional)",  opt_cols, index=_opt_index(col_vendor))
+    col_fleet  = None if col_fleet  == "(none)" else col_fleet
+    col_vendor = None if col_vendor == "(none)" else col_vendor
+
+if col_vendor is None:
+    st.caption("ℹ️ No **Vendor** column found in the file — Vendor will show as blank.")
 
 # ── Normalise ─────────────────────────────────────────────────────────────────
 df = pd.DataFrame({
     "Vessel":             df[col_vessel],
     "Fleet":              df[col_fleet] if col_fleet else "",
+    "Vendor":             df[col_vendor].fillna("").astype(str).str.strip() if col_vendor else "",
     "Latest Report Date": df[col_report_date],
     "Remarks":            df[col_remarks],
     "VesselCheck":        df[col_vessel_check],
@@ -175,25 +182,16 @@ report_date_dt  = pd.to_datetime(df["Latest Report Date"], errors="coerce").dt.n
 vc_date_dt      = pd.to_datetime(df["VesselCheck"],        errors="coerce").dt.normalize()
 today           = pd.Timestamp(date.today())
 
-df["Days Since Report"] = (today - report_date_dt).dt.days.astype("Int64")
+days = (today - report_date_dt).dt.days          # float, NaN where no date
+df["Days Since Report"] = days.astype("Int64")
 
-def classify_status(d):
-    if pd.isna(d):
-        return "No Date"
-    return "Up-to-date" if d <= 120 else "Overdue"
-
-df["Status"] = df["Days Since Report"].apply(classify_status)
-
-def overdue_bucket(d):
-    if pd.isna(d) or d <= 120:
-        return None
-    if d <= 180:
-        return "120–180 days"
-    if d <= 210:
-        return "181–210 days"
-    return "210+ days"
-
-df["Overdue Bucket"] = df["Days Since Report"].apply(overdue_bucket)
+df["Status"] = np.select(
+    [days.isna(), days <= UPTODATE_DAYS], ["No Date", "Up-to-date"], default="Overdue"
+)
+df["Overdue Bucket"] = (
+    pd.cut(days, bins=[UPTODATE_DAYS, 180, 210, np.inf], labels=BUCKET_ORDER)
+    .astype(object).where(lambda s: s.notna(), None)
+)
 
 # Format dates as plain strings
 df["Latest Report Date"] = report_date_dt.dt.strftime("%Y-%m-%d").fillna("")
@@ -201,16 +199,16 @@ df["VesselCheck"]        = vc_date_dt.dt.strftime("%Y-%m-%d").fillna(
     df["VesselCheck"].astype(str).replace("nan", ""))
 
 # ── Derived metrics ───────────────────────────────────────────────────────────
-total      = len(df)
-n_uptodate = (df["Status"] == "Up-to-date").sum()
-n_overdue  = (df["Status"] == "Overdue").sum()
-n_nodate   = (df["Status"] == "No Date").sum()
+total         = len(df)
+status_counts = df["Status"].value_counts()
+n_uptodate    = int(status_counts.get("Up-to-date", 0))
+n_overdue     = int(status_counts.get("Overdue", 0))
+n_nodate      = int(status_counts.get("No Date", 0))
 
-n_31_60 = (df["Overdue Bucket"] == "120–180 days").sum()
-n_61_90 = (df["Overdue Bucket"] == "181–210 days").sum()
-n_90p   = (df["Overdue Bucket"] == "210+ days").sum()
+bucket_counts = df["Overdue Bucket"].value_counts().reindex(BUCKET_ORDER, fill_value=0)
+n_31_60, n_61_90, n_90p = (int(x) for x in bucket_counts)
 
-vc_has_date  = (df["VesselCheck"].str.match(r"\d{4}-\d{2}-\d{2}")).sum()
+vc_has_date  = int(vc_date_dt.notna().sum())
 vc_no_date   = total - vc_has_date
 
 # ── Normalise Remarks → clean strings, then classify ─────────────────────────
@@ -250,14 +248,8 @@ health_pct        = round(n_uptodate_active / active_fleet * 100, 1) if active_f
 # Unique Remarks values for sidebar filter — exclude Blank/NA (handled by checkbox)
 remarks_opts = sorted(df.loc[~is_na_mask, "Remarks"].unique().tolist())
 
-# VesselCheck date series and month-year labels for filter/chart
-vc_date_dt_series = pd.to_datetime(df["VesselCheck"], errors="coerce")
-vc_month_series   = vc_date_dt_series.dt.to_period("M")
-# Format as "Jan 2026" for display
-vc_month_labels_sorted = sorted(vc_month_series.dropna().unique().tolist(), key=lambda p: p.ordinal)
-vc_month_display  = [p.strftime("%b %Y") for p in vc_month_labels_sorted]
-# Map "Jan 2026" -> Period for reverse lookup
-vc_display_to_period = {p.strftime("%b %Y"): p for p in vc_month_labels_sorted}
+# VesselCheck month periods for filter/chart (reuses the already-parsed dates)
+vc_month_series = vc_date_dt.dt.to_period("M")
 
 # ── Sidebar filters ───────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
@@ -266,6 +258,9 @@ sel_status  = st.sidebar.multiselect("Status", status_opts, default=status_opts)
 vessel_opts = sorted(df["Vessel"].dropna().astype(str).unique().tolist())
 sel_vessels = st.sidebar.multiselect("Vessel", options=vessel_opts, default=[],
                                      help="Leave blank to include all vessels")
+vendor_opts = sorted(v for v in df["Vendor"].astype(str).unique() if v)
+sel_vendors = st.sidebar.multiselect("Vendor", options=vendor_opts, default=[],
+                                     help="Leave blank to include all vendors")
 
 st.sidebar.markdown("**Remarks**")
 include_blank_remarks = st.sidebar.checkbox("Include Blank remarks", value=True)
@@ -278,11 +273,10 @@ sel_remarks = st.sidebar.multiselect(
 )
 
 st.sidebar.markdown("**VesselCheck Date Range**")
-vc_valid_dates = vc_date_dt_series.dropna()
+vc_valid_dates = vc_date_dt.dropna()
 if not vc_valid_dates.empty:
     vc_min_date = vc_valid_dates.min().date()
     vc_max_date = vc_valid_dates.max().date()
-    import datetime as _dt
     vc_date_from = st.sidebar.date_input(
         "From", value=vc_min_date,
         min_value=vc_min_date, max_value=vc_max_date, key="vc_from"
@@ -291,18 +285,18 @@ if not vc_valid_dates.empty:
         "To", value=vc_max_date,
         min_value=vc_min_date, max_value=vc_max_date, key="vc_to"
     )
-    sel_vc_months = [
-        lbl for lbl, p in vc_display_to_period.items()
-        if _dt.date(p.year, p.month, 1) >= _dt.date(vc_date_from.year, vc_date_from.month, 1)
-        and _dt.date(p.year, p.month, 1) <= _dt.date(vc_date_to.year, vc_date_to.month, 1)
-    ]
+    # Month-level range (whole months from "From" to "To" inclusive)
+    vc_in_range = vc_month_series.between(
+        pd.Period(vc_date_from, "M"), pd.Period(vc_date_to, "M")
+    )
 else:
-    vc_date_from = vc_date_to = None
-    sel_vc_months = []
+    vc_in_range = None
 
 mask = df["Status"].isin(sel_status)
 if sel_vessels:
     mask &= df["Vessel"].astype(str).isin(sel_vessels)
+if sel_vendors:
+    mask &= df["Vendor"].isin(sel_vendors)
 if sel_remarks or not include_blank_remarks or not include_na_remarks:
     if sel_remarks:
         remark_match = df["Remarks"].isin(sel_remarks)
@@ -316,15 +310,14 @@ if sel_remarks or not include_blank_remarks or not include_na_remarks:
             mask &= (df["Remarks"] != "Blank")
         if not include_na_remarks:
             mask &= (df["Remarks"] != "NA")
-if sel_vc_months:
-    sel_periods = set(vc_display_to_period[lbl] for lbl in sel_vc_months if lbl in vc_display_to_period)
-    vc_month_mask = vc_month_series.isin(sel_periods) | vc_month_series.isna()
-    mask &= vc_month_mask
+if vc_in_range is not None:
+    # Vessels without a VesselCheck date are always kept
+    mask &= vc_in_range | vc_month_series.isna()
 filtered = df[mask].copy()
 
 st.sidebar.divider()
 st.sidebar.markdown("**Export**")
-display_cols = ["Vessel", "Fleet", "Latest Report Date", "Days Since Report",
+display_cols = ["Vessel", "Fleet", "Vendor", "Latest Report Date", "Days Since Report",
                 "Status", "Overdue Bucket", "VesselCheck", "Remarks"]
 display_cols = [c for c in display_cols if c in filtered.columns]
 csv_buf = filtered[display_cols].to_csv(index=False).encode()
@@ -418,10 +411,9 @@ ch1, ch2 = st.columns(2)
 
 with ch1:
     color_map = {"Up-to-date": "#2ecc71", "Overdue": "#e74c3c", "No Date": "#95a5a6"}
-    status_counts = df["Status"].value_counts().reset_index()
-    status_counts.columns = ["Status", "Count"]
+    status_df = status_counts.rename_axis("Status").reset_index(name="Count")
     fig_pie = px.pie(
-        status_counts, names="Status", values="Count",
+        status_df, names="Status", values="Count",
         title="Report Status Distribution",
         color="Status", color_discrete_map=color_map, hole=0.4,
     )
@@ -429,15 +421,8 @@ with ch1:
     st.plotly_chart(fig_pie, use_container_width=True)
 
 with ch2:
-    bucket_order = ["120–180 days", "181–210 days", "210+ days"]
     bucket_colors = {"120–180 days": "#f39c12", "181–210 days": "#e67e22", "210+ days": "#e74c3c"}
-    overdue_buckets = (
-        df[df["Overdue Bucket"].notna()]["Overdue Bucket"]
-        .value_counts()
-        .reindex(bucket_order, fill_value=0)
-        .reset_index()
-    )
-    overdue_buckets.columns = ["Bucket", "Count"]
+    overdue_buckets = bucket_counts.rename_axis("Bucket").reset_index(name="Count")
     fig_bucket = px.bar(
         overdue_buckets, x="Bucket", y="Count",
         title="Overdue Severity Breakdown",
@@ -452,9 +437,8 @@ ch3, ch4 = st.columns(2)
 
 with ch3:
     # Reporting activity by month
-    rpt_dates = pd.to_datetime(df["Latest Report Date"], errors="coerce")
     monthly = (
-        rpt_dates.dropna()
+        report_date_dt.dropna()
         .dt.to_period("M")
         .value_counts()
         .sort_index()
@@ -491,11 +475,8 @@ with ch4:
 st.markdown("### VesselCheck by Month")
 
 # Build month series using only the selected period range
-if sel_vc_months:
-    sel_periods_chart = set(vc_display_to_period[lbl] for lbl in sel_vc_months if lbl in vc_display_to_period)
-    vc_monthly_filtered = vc_month_series[vc_month_series.isin(sel_periods_chart)]
-else:
-    vc_monthly_filtered = vc_month_series.dropna()
+vc_detail_mask      = vc_in_range if vc_in_range is not None else vc_month_series.notna()
+vc_monthly_filtered = vc_month_series[vc_detail_mask]
 
 # Aggregate: count vessels per month, format label as "Mon YYYY"
 vc_by_month = (
@@ -526,12 +507,8 @@ else:
     st.plotly_chart(fig_vc_month, use_container_width=True)
 
     with st.expander("📅 VesselCheck Month Detail Table"):
-        if sel_vc_months:
-            vc_detail_mask = vc_month_series.isin(sel_periods_chart)
-        else:
-            vc_detail_mask = vc_month_series.notna()
-        vc_detail = df[vc_detail_mask][
-            ["Vessel", "VesselCheck", "Status", "Remarks"]
+        vc_detail = df.loc[vc_detail_mask,
+            ["Vessel", "Fleet", "Vendor", "VesselCheck", "Status", "Remarks"]
         ].sort_values("VesselCheck")
         st.dataframe(vc_detail, use_container_width=True)
 
@@ -543,7 +520,7 @@ overdue_df["Bar Value"]  = overdue_df["Days Since Report"].astype(float)
 overdue_df["Label"]      = overdue_df["Overdue Bucket"].fillna("Overdue")
 overdue_df["Bar Type"]   = "Overdue"
 
-uptodate_df["Days Left"] = 120 - uptodate_df["Days Since Report"].astype(float)
+uptodate_df["Days Left"] = UPTODATE_DAYS - uptodate_df["Days Since Report"].astype(float)
 uptodate_df["Bar Value"] = uptodate_df["Days Left"]
 uptodate_df["Label"]     = "Up-to-date"
 uptodate_df["Bar Type"]  = "Up-to-date"
@@ -574,11 +551,12 @@ if not bar_df.empty:
             f"{len(overdue_df)} overdue / {len(uptodate_df)} up-to-date in current filter"
         ),
         labels={"Bar Value": "Days", "Label": "Status"},
-        custom_data=["Status", "Days Since Report", "Days Left"] if "Days Left" in bar_df.columns else ["Status"],
+        custom_data=["Status", "Days Since Report", "Days Left", "Vendor"],
     )
     fig_over.update_traces(
         hovertemplate=(
             "<b>%{x}</b><br>"
+            "Vendor: %{customdata[3]}<br>"
             "Status: %{customdata[0]}<br>"
             "Days since report: %{customdata[1]}<br>"
             "Days left: %{customdata[2]}<extra></extra>"
@@ -597,20 +575,20 @@ st.divider()
 # ── Data table ────────────────────────────────────────────────────────────────
 st.markdown(f"### Vessel Table ({len(filtered)} of {total})")
 
-def highlight_status(row):
-    s = row.get("Status", "")
-    if s == "Overdue":
-        return ["background-color: #fdecea"] * len(row)
-    if s == "Up-to-date":
-        return ["background-color: #eafaf1"] * len(row)
-    return [""] * len(row)
+_ROW_COLOURS = {"Overdue": "background-color: #fdecea", "Up-to-date": "background-color: #eafaf1"}
 
-styled = filtered[display_cols].style.apply(highlight_status, axis=1)
+def highlight_status(table):
+    # Whole-table styling in one pass (faster than row-by-row apply)
+    colour = table["Status"].map(_ROW_COLOURS).fillna("")
+    return pd.DataFrame(np.repeat(colour.to_numpy()[:, None], table.shape[1], axis=1),
+                        index=table.index, columns=table.columns)
+
+styled = filtered[display_cols].style.apply(highlight_status, axis=None)
 st.dataframe(styled, use_container_width=True, height=450)
 
 # ── Vessels never reported ────────────────────────────────────────────────────
 with st.expander("🚫 Vessels with No Report Date"):
-    no_date_df = df[df["Status"] == "No Date"][["Vessel", "VesselCheck", "Remarks"]]
+    no_date_df = df.loc[df["Status"] == "No Date", ["Vessel", "Fleet", "Vendor", "VesselCheck", "Remarks"]]
     if no_date_df.empty:
         st.success("All vessels have a report date recorded.")
     else:
